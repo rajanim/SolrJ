@@ -1,0 +1,610 @@
+	package com.os.solr.search.service.impl;
+	
+	import java.io.File;
+	import java.io.UnsupportedEncodingException;
+	import java.net.URLEncoder;
+	import java.util.ArrayList;
+	import java.util.HashMap;
+	import java.util.List;
+	import java.util.Map;
+	import java.util.regex.Matcher;
+	import java.util.regex.Pattern;
+	
+	import org.apache.solr.client.solrj.SolrQuery;
+	import org.apache.solr.client.solrj.SolrQuery.ORDER;
+	import org.apache.solr.client.solrj.SolrServerException;
+	import org.apache.solr.client.solrj.impl.BinaryRequestWriter;
+	import org.apache.solr.client.solrj.impl.XMLResponseParser;
+	import org.apache.solr.client.solrj.response.FacetField;
+	import org.apache.solr.client.solrj.response.FacetField.Count;
+	import org.apache.solr.client.solrj.response.SpellCheckResponse;
+	import org.apache.solr.client.solrj.response.SpellCheckResponse.Suggestion;
+	import org.apache.solr.client.solrj.response.TermsResponse;
+	import org.apache.solr.client.solrj.response.TermsResponse.Term;
+	import org.apache.solr.common.SolrDocument;
+	import org.apache.solr.common.SolrDocumentList;
+	import org.apache.solr.common.params.CommonParams;
+	import org.apache.solr.common.params.ModifiableSolrParams;
+	import org.apache.solr.common.params.SpellingParams;
+	import org.apache.solr.common.util.NamedList;
+	import org.codehaus.jackson.map.ObjectMapper;
+	import org.slf4j.Logger;
+	import org.slf4j.LoggerFactory;
+	
+	import com.os.search.service.helper.QueryPreparer;
+	import com.os.solr.search.constants.SearchConstants;
+	import com.os.solr.search.content.handler.PromotionsHandler;
+	import com.os.solr.search.custom.solrj.CustomHttpSolrServer;
+	import com.os.solr.search.custom.solrj.CustomQueryResponse;
+	import com.os.solr.search.form.SearchForm;
+	import com.os.solr.search.helper.SearchHelper;
+	import com.os.solr.search.helper.ServiceHelper;
+	import com.os.solr.search.helper.URLHelper;
+	import com.os.solr.search.service.SearchService;
+	import com.os.solr.search.service.dto.FacetDTO;
+	import com.os.solr.search.service.dto.ResultsDTO;
+	import com.os.solr.search.service.dto.SearchResultDTO;
+	import com.os.solr.search.service.dto.SubCategoryFacetDTO;
+	import com.os.solr.search.service.dto.SuggestionsDTO;
+	import com.os.solr.search.service.dto.SynonymDTO;
+	
+	
+	public class SearchServiceImpl implements SearchService {
+	
+		private final CustomHttpSolrServer solrServer;
+	
+		private final Logger logger = LoggerFactory
+				.getLogger(SearchServiceImpl.class);
+	
+		public SearchServiceImpl() {
+			try {
+				solrServer = new CustomHttpSolrServer(ServiceHelper.getSolrURL());
+				solrServer.setAllowCompression(true);
+			} catch (Exception e) {
+				e.printStackTrace();
+				throw new RuntimeException(e);
+			}
+		}
+	
+		@Override
+		public List<SuggestionsDTO> getSuggestions(String keyword) {
+			if(keyword.trim().isEmpty()) {
+				return null;
+			} else {
+				String[] keys = keyword.split(" ");
+				List<SuggestionsDTO> autosuggestions = new ArrayList<SuggestionsDTO>(); 
+				for(String key: keys) {
+					if(!key.trim().isEmpty() && autosuggestions.size() < SearchConstants.SUGGESTIONS_LIMIT) {
+						for(SuggestionsDTO suggestion : getHighlightingSuggestions(key)) {
+							if(autosuggestions.size() < SearchConstants.SUGGESTIONS_LIMIT && !autosuggestions.contains(suggestion)) {
+								autosuggestions.add(suggestion);
+							} else {
+								break;
+							}
+						}
+					}
+				}
+				return autosuggestions;
+			}
+		}
+	
+		public List<SuggestionsDTO> getHighlightingSuggestions(String keyword) {
+			try {
+				SolrQuery query = getHighLightQuery("\""+keyword+"\"");
+				QueryResponse queryResponse = solrServer.query(query);
+				List<SuggestionsDTO> suggestions = getHighlightingTermsFromResponse(
+						queryResponse, keyword);
+				if (suggestions == null || suggestions.isEmpty()) {
+					suggestions = getHighlightSuggest(keyword);
+				}
+				return suggestions;
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+		}
+	
+		private static SolrQuery getHighLightQuery(String keyword) {
+			SolrQuery query = getKeywordQuery(keyword);
+			query.setFields(ResultsDTO.PAGE_ID);
+			query.setRows(200);
+			query.setHighlight(true).setHighlightSnippets(5);
+			query.setHighlight(true).setParam("hl.simple.pre", "<b>");
+			query.setHighlight(true).setParam("hl.simple.post", "</b>");
+			query.setParam("hl.fl", SearchConstants.SOLR_FIELD_KEYS);
+			return query;
+		}
+	
+		private static SolrQuery getKeywordQuery(String keyword) {
+			SolrQuery query = new SolrQuery();
+	
+			StringBuffer suggestQuery = new StringBuffer();
+			suggestQuery.append(SearchConstants.SOLR_FIELD_KEYS).append(":")
+					.append(escapeKeyword(keyword.toLowerCase(),false));
+	
+			query.setQuery(suggestQuery.toString());
+			query.addFilterQuery(" NOT(" + SearchConstants.SOLR_FIELD_FLAG
+					+ ":" + SearchConstants.SOLR_FLAG
+					+ ")");
+			query.addFilterQuery(SearchConstants.SOLR_FIELD_ACTIVE + ":"
+					+ SearchConstants.ACTIVE_FLAG);
+	
+			return query;
+		}
+	
+		/**
+		 * Helper method that takes Solr response and extracts the terms. The result
+		 * is a list of strings containing the name of the terms. The result of this
+		 * method can be a empty list.
+		 * 
+		 * @param queryResponse
+		 *            that contains the information returned by Solr
+		 * 
+		 * @return the List of String retrieved from the Solr response, the string
+		 *         will contain only the Count.name fields.
+		 */
+		private List<SuggestionsDTO> getHighlightingTermsFromResponse(
+				final CustomQueryResponse queryResponse, final String prefix) {
+	
+			List<SuggestionsDTO> suggestions = new ArrayList<SuggestionsDTO>();
+			NamedList<Object> sortedList = queryResponse.getHighlightingInfo();
+	
+			// highlighting = new HashMap<String, Map<String, List<String>>>();
+			for (Map.Entry<String, Object> doc : sortedList) {
+	
+				NamedList<List<String>> fnl = (NamedList<List<String>>) doc
+						.getValue();
+				for (Map.Entry<String, List<String>> field : fnl) {
+					if (field.getValue() != null) {
+						for (String value : field.getValue()) {
+							if (value != null) {
+								if (suggestions.size() == SearchConstants.SUGGESTIONS_LIMIT) {
+									break;
+								}
+								SuggestionsDTO autoSuggest = new SuggestionsDTO();
+								autoSuggest.setLabel(value);
+	
+								Matcher matcher = HIGHTLIGHT_PATTERN.matcher(value);
+								if (matcher.find()) {
+									value = value.replace("<b>", "");
+									value = value.replace("</b>", "");
+									autoSuggest.setValue(value);
+								}
+	
+								if (value.toLowerCase().equalsIgnoreCase(
+										prefix.toLowerCase())
+										|| suggestions.contains(autoSuggest)) {
+									continue;
+								}
+	
+								suggestions.add(autoSuggest);
+							}
+						}
+					}
+				}
+			}
+	
+			return suggestions;
+		}
+	
+		public List<SuggestionsDTO> getHighlightSuggest(String prefix) {
+			try {
+				// http://43.88.68.73:8080/Chinesesolr3.6/select/?q=KEYS:LED&fl=KEYS&version=2.2&start=0&rows=10&indent=on&hl=true&hl.fl=KEYS
+				String prefixWithStar = prefix.trim();
+				if(prefix.trim().contains("\"") || prefix.trim().contains("*") )
+					prefixWithStar = prefix.replace("*", "").trim();
+					else
+				 prefixWithStar = prefix.trim() + "*";
+				SolrQuery query = getHighLightQuery(prefixWithStar);
+	
+				CustomQueryResponse queryResponse = solrServer.query(query);
+				solrServer.setParser(new XMLResponseParser());
+				List<SuggestionsDTO> suggestions = getHighlightingTermsFromResponse(
+						queryResponse, prefixWithStar);
+	
+				if (suggestions == null || suggestions.isEmpty()) {
+					suggestions = getPrefixedFacetSuggestions(prefix);
+					if (suggestions == null || suggestions.isEmpty()) {
+						suggestions = spellCheck(prefix);
+					}
+				}
+	
+				return suggestions;
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+		}
+	
+		private final static String HIGHLIGHTED_SUGGEST_REGEX = "<b>(.*?)</b>";
+		private final static Pattern HIGHTLIGHT_PATTERN = Pattern.compile(
+				HIGHLIGHTED_SUGGEST_REGEX, Pattern.CASE_INSENSITIVE);
+	
+		public List<SuggestionsDTO> getPrefixedFacetSuggestions(String prefix) {
+			try {
+				SolrQuery query = getKeywordQuery(prefix);
+				query.setFields(ResultsDTO.CAT_NAME + "," + ResultsDTO.TITLE);
+				query.setFacet(true);
+				query.addFacetField(SearchConstants.SOLR_FIELD_AUTO_SUGGEST_KEYS);
+				query.setFacetPrefix(prefix);
+				query.setFacetMinCount(Integer.valueOf(1));
+				query.setFacetLimit(SearchConstants.SUGGESTIONS_LIMIT);
+				QueryResponse queryResponse = solrServer.query(query);
+				return getFacetTermsFromResponse(queryResponse, prefix);
+			} catch (Exception e) {
+				logger.error(e.getMessage(), e);
+				throw new RuntimeException(e);
+			}
+		}
+	
+		/**
+		 * Helper method that takes Solr response and extracts the terms. The result
+		 * is a list of strings containing the name of the terms. The result of this
+		 * method can be a empty list.
+		 * 
+		 * @param queryResponse
+		 *            that contains the information returned by Solr
+		 * 
+		 * @return the List of String retrieved from the Solr response, the string
+		 *         will contain only the Count.name fields.
+		 */
+		private List<SuggestionsDTO> getFacetTermsFromResponse(
+				final CustomQueryResponse queryResponse, final String prefix) {
+			List<SuggestionsDTO> suggestions = new ArrayList<SuggestionsDTO>();
+	
+			List<FacetField> fctFields = queryResponse.getFacetFields();
+	
+			for (FacetField fctfld : fctFields) {
+	
+				if (fctfld.getValueCount() > 0) {
+					for (Count c : fctfld.getValues()) {
+	
+						SuggestionsDTO autoSuggest = new SuggestionsDTO();
+	
+						if(c != null && !c.getName().equalsIgnoreCase(prefix)) {
+							autoSuggest.setLabel(c.getName());
+							autoSuggest.setValue(c.getName());
+	
+							suggestions.add(autoSuggest);
+						}
+						
+					}
+				}
+			}
+			if (suggestions == null || suggestions.isEmpty()) {
+				// Do a spell check
+				// http://43.88.68.73:8080/Chinesesolr3.6/spell?q=*:*&spellcheck.build=true&spellcheck.q=KDL&spellcheck=true&wt=xml&rows=0
+				suggestions = spellCheck(prefix);
+			}
+	
+			return suggestions;
+		}
+	
+		/**
+		 * spellcheck=true - because we always want to run the Suggester for queries
+		 * submitted to this handler. spellcheck.dictionary=suggest - this is the
+		 * name of the dictionary component that we configured above.
+		 * spellcheck.onlyMorePopular=true - if this parameter is set to true then
+		 * the suggestions will be sorted by weight ("popularity") - the count
+		 * parameter will effectively limit this to a top-N list of best
+		 * suggestions. If this is set to false then suggestions are sorted
+		 * alphabetically. spellcheck.count=5 - specifies to return up to 5
+		 * suggestions. spellcheck.collate=true - to provide a query collated with
+		 * the first matching suggestion
+		 * 
+		 * @param prefix
+		 * @return
+		 */
+		public List<SuggestionsDTO> spellCheck(String prefix) {
+			List<SuggestionsDTO> suggestions = new ArrayList<SuggestionsDTO>();
+			ModifiableSolrParams params = new ModifiableSolrParams();
+			params.set(CommonParams.QT, "/spell");
+			params.set(CommonParams.Q, getKeywordQuery(prefix).getQuery());
+			params.set(SpellingParams.SPELLCHECK_Q, prefix);
+			params.set(SpellingParams.SPELLCHECK_COUNT,
+					SearchConstants.SUGGESTIONS_LIMIT);
+			params.set("spellcheck", "true");
+			params.set(SpellingParams.SPELLCHECK_BUILD, "true");
+			params.set(SpellingParams.SPELLCHECK_EXTENDED_RESULTS, "true");
+			CustomQueryResponse response;
+			try {
+				response = solrServer.query(params);
+	
+				SpellCheckResponse spellCheckResponse = response
+						.getSpellCheckResponse();
+				if (!spellCheckResponse.isCorrectlySpelled()) {
+					for (Suggestion suggestion : response.getSpellCheckResponse()
+							.getSuggestions()) {
+						List<String> alternatives = suggestion.getAlternatives();
+						if (alternatives != null) {
+							for (String alternate : alternatives) {
+								SuggestionsDTO autoSuggest = new SuggestionsDTO();
+								autoSuggest.setLabel(alternate);
+								autoSuggest.setValue(alternate);
+	
+								suggestions.add(autoSuggest);
+							}
+						}
+					}
+				}
+			} catch (SolrServerException e) {
+				logger.error(e.getMessage(), e);
+				throw new RuntimeException(e);
+			}
+	
+			return suggestions;
+		}
+	
+		public SearchResultDTO getSearchResults(SearchForm searchForm) {
+			String keyword = trimWithSpecialCharacters(searchForm.getKeyword());
+			if(!searchForm.getKeyword().isEmpty() && keyword.trim().isEmpty())
+			{
+				SearchResultDTO searchResult = new SearchResultDTO();
+				searchResult.setResultCount(Long.parseLong("0"));
+				return searchResult;
+			}
+			else
+			{	
+				searchForm.setKeyword(keyword);
+				SearchResultDTO searchResult = new SearchResultDTO();
+				CustomQueryResponse response = getQueryResponse(searchForm);
+	
+			if (searchForm.getPageSize() == -1) {
+				searchForm.setPageSize(Long.valueOf(
+						response.getResults().getNumFound()).intValue());
+				response = getQueryResponse(searchForm);
+			}
+			searchResult.setResultCount(response.getResults().getNumFound());
+			searchResult.setResults(fillSearchDetails(response));
+			searchResult.setCategories(fillFacetDetails(response, searchForm));
+			
+			return searchResult;
+		}
+	}
+	
+		private List<FacetDTO> fillFacetDetails(CustomQueryResponse response,
+				SearchForm searchForm) {
+			List<FacetDTO> resultFacets = new ArrayList<FacetDTO>();
+			List<FacetField> facets = response.getFacetFields();
+			if (facets != null && !facets.isEmpty()) {
+				for (FacetField facet : facets) {
+					List<FacetField.Count> facetEntries = facet.getValues();
+					if (facetEntries != null && !facetEntries.isEmpty()) {
+						FacetDTO catTypeFacets = new FacetDTO();
+						List<SubCategoryFacetDTO> subCategories = new ArrayList<SubCategoryFacetDTO>();
+						for (FacetField.Count fcount : facetEntries) {
+							SubCategoryFacetDTO catFacet = new SubCategoryFacetDTO();
+							catFacet.setCategoryName(fcount.getName());
+							catFacet.setCount(fcount.getCount());
+							subCategories.add(catFacet);		
+						}
+						catTypeFacets.setSubCategories(subCategories);
+						resultFacets.add(catTypeFacets);
+					}
+				}
+			}
+			return resultFacets;
+		}
+	
+		private static boolean checkSubCatInsearch(SearchForm searchForm,
+				String facetName) {
+			boolean exists = false;
+			if (searchForm.getSubCategories() != null) {
+				for (String subcat : searchForm.getSubCategories()) {
+					String[] catType = subcat.split(":");
+	
+					if (catType != null && catType[0].equalsIgnoreCase(facetName)) {
+						exists = true;
+					}
+				}
+			}
+	
+			return exists;
+		}
+	
+		private List<ResultsDTO> fillSearchDetails(CustomQueryResponse response) {
+	
+			List<ResultsDTO> resSet = new ArrayList<ResultsDTO>();
+			SolrDocumentList sdl = response.getResults();
+	
+			for (SolrDocument results : sdl) {
+				ResultsDTO resDTO = new ResultsDTO();
+				resDTO.setCategoryID(String.valueOf(results
+						.getFieldValue(ResultsDTO.CAT_ID)));
+				resDTO.setSearchID(String.valueOf(results
+						.getFieldValue(ResultsDTO.SEARCH_ID)));
+				resDTO.setCategoryName(String.valueOf(results
+						.getFieldValue(ResultsDTO.CAT_NAME)));
+				resDTO.setTitle(String.valueOf(results
+						.getFieldValue(ResultsDTO.TITLE)));
+				resDTO.setDescription(String.valueOf(results
+						.getFieldValue(ResultsDTO.DESC)));
+	
+				if (results.getFieldValue(ResultsDTO.STATUS) != null
+						&& !"".equalsIgnoreCase(results
+								.getFieldValue(ResultsDTO.STATUS).toString().trim()))
+	
+				resSet.add(resDTO);
+			}
+	
+			return resSet;
+		}
+	
+		private CustomQueryResponse getQueryResponse(SearchForm searchForm) {
+			try {
+				SolrQuery query = QueryPreparer.prepareQuery(searchForm);
+				CustomQueryResponse queryResponse = solrServer.query(query);
+				solrServer.setParser(new XMLResponseParser());
+				return queryResponse;
+			} catch (Exception e) {
+				logger.error(e.getMessage(), e);
+				throw new RuntimeException(e);
+			}
+		}
+	
+		
+		public List<Term> getSimilarKeywords(String keyword) {
+				List<Term> similarKeywords = new ArrayList<Term>();
+				List<String> synonyms = getSynonyms(keyword);
+				for (String simKey : synonyms) {
+					if(similarKeywords.size() >= SearchConstants.SUGGESTIONS_LIMIT) {
+						break;
+					}
+					if(!simKey.trim().equalsIgnoreCase(keyword.trim())) {
+						Term term = new Term(simKey, 1);
+						similarKeywords.add(term);
+					}
+				}
+				if(similarKeywords.isEmpty()) {
+					List<SuggestionsDTO> suggestions = getSuggestions(keyword);
+					for (SuggestionsDTO termSuggestion : suggestions) {
+						if (termSuggestion.getValue() != null
+								&& !termSuggestion.getValue().equalsIgnoreCase(keyword)) {
+							Term term = new Term(termSuggestion.getValue(), 1);
+							similarKeywords.add(term);
+						}
+					}
+				return similarKeywords;
+			}
+		}
+	
+			
+		private List<String> getSynonyms(String keyword) {
+			List<String> synonyms = new ArrayList<String>();
+			StringBuffer synonymURL = new StringBuffer(ServiceHelper.getSolrURL());
+			if (!ServiceHelper.getSolrURL().endsWith("/") && !ServiceHelper.getSolrURL().endsWith("\\")) {
+				synonymURL.append(File.separator);
+			}
+			try {
+				synonymURL.append(SearchConstants.SYNONYMS_FILE_RELATIVE_URL)
+						.append(URLEncoder.encode(keyword, "UTF-8"));
+				String serverResponse = URLHelper.getResponse(synonymURL.toString(),
+						URLHelper.CONTENT_TYPE_XML);
+				if (!serverResponse.isEmpty()) {
+					ObjectMapper mapper = new ObjectMapper();
+					try {
+						SynonymDTO result = mapper.readValue(serverResponse.toString()
+								.getBytes("UTF-8"), SynonymDTO.class);
+	
+						synonyms = result.getResponse();
+					} catch (Exception e) {
+						logger.error(e.getMessage(), e);
+						throw new RuntimeException(e);
+					}
+				}
+			} catch (UnsupportedEncodingException e1) {
+				logger.error(e1.getMessage(), e1);
+				throw new RuntimeException(e1);
+			}
+	
+			return synonyms;
+		}
+	
+		public List<Term> fetchSimilarKeywords(String keyword) {
+			List<Term> similarKeywords = new ArrayList<Term>();
+			SolrQuery query = getKeywordQuery(keyword);
+			query.addTermsField(SearchConstants.SOLR_FIELD_AUTO_SUGGEST_KEYS);
+			query.setTerms(true);
+			query.setTermsSortString("index");
+			query.setTermsLimit(SearchConstants.TERMS_LIMIT);
+			query.setTermsPrefix(escapeKeyword(keyword));
+			query.setTermsSortString("frequency");
+			query.setQueryType("/terms");
+			logger.info("Query For Similar Keywords : " + query);
+			try {
+				CustomQueryResponse queryResponse = solrServer.query(query);
+				solrServer.setParser(new XMLResponseParser());
+				TermsResponse resp = queryResponse.getTermsResponse();
+				if (resp != null) {
+					similarKeywords
+							.addAll(resp
+									.getTerms(SearchConstants.SOLR_FIELD_AUTO_SUGGEST_KEYS));
+					if (similarKeywords.size() == 0) {
+						similarKeywords.addAll(resp
+								.getTerms(SearchConstants.SOLR_FIELD_KEYS));
+					}
+				}
+			} catch (SolrServerException e) {
+				logger.error(e.getMessage(), e);
+				throw new RuntimeException(e);
+			}
+			return similarKeywords;
+		}
+	
+		@Override
+		public List<ResultsDTO> getDidYouMeanSearchResults(SearchForm form) {
+			StringBuffer keywordQuery = new StringBuffer();
+			if(form.getKeyword() == null || form.getKeyword().trim().equalsIgnoreCase("")) {
+				keywordQuery.append("*:*");
+			} else {
+				List<SuggestionsDTO> suggestions = getAutoSuggestionsForZeroSearch(form.getKeyword());
+				StringBuffer keys = new StringBuffer();
+				
+				if(suggestions != null && !suggestions.isEmpty()) {
+					keys.append(" (");
+					for(SuggestionsDTO suggest: suggestions) {
+						keys.append(suggest.getValue() + " ");
+					}				
+					keys.trimToSize();
+					if(keys.toString().trim().equalsIgnoreCase(form.getKeyword().trim())) {
+						keys.append("*");
+					}
+					keys.append(") ");
+					getKeywordQuery(keywordQuery, keys.toString());
+				} else {
+					String[] splitKeys = form.getKeyword().split(" ");
+					keys.append(" (");
+					for(String key: splitKeys) {
+						if(!key.trim().isEmpty()) {
+							keys.append(" *" + key.trim() + "* ");
+						}
+					}
+					keys.append(") ");		
+					getKeywordQuery(keywordQuery, keys.toString());
+				}
+			}
+			SolrQuery query = new SolrQuery();
+			query.setQuery(keywordQuery.toString());
+			
+			query.addSortField(SearchConstants.SOLR_FIELD_SCORE, ORDER.desc);
+			query.addSortField(ResultsDTO.RANK_BY_CATEGORY, ORDER.asc);
+			query.addFilterQuery("NOT(" + SearchConstants.SOLR_FIELD_FLAG
+					+ ":" + SearchConstants.SOLR_FLAG
+					+ ")");
+			query.addFilterQuery(SearchConstants.SOLR_FIELD_ACTIVE + ":"
+					+ SearchConstants.ACTIVE_FLAG);
+			int start = 0;
+			if (form.getPageSize() == null || form.getPageSize() < 1) {
+				query.setRows(15);
+			} else {
+				query.setRows(form.getPageSize());
+			}
+			if (form.getPageNum() != null && form.getPageNum() > 1) {
+				start = (form.getPageNum() - 1) * form.getPageSize();
+			}
+			query.setStart(start);
+			List<ResultsDTO> searchResult = new ArrayList<ResultsDTO>();
+			try {
+				CustomQueryResponse queryResponse = solrServer.query(query);
+				solrServer.setParser(new XMLResponseParser());
+				searchResult = fillSearchDetails(queryResponse);
+			} catch (Exception e) {
+				logger.error(e.getMessage(), e);
+				throw new RuntimeException(e);
+			}
+	
+			return searchResult;
+		}
+		
+		private static void getKeywordQuery(StringBuffer keywordQuery, String keyword) {
+			keywordQuery
+			.append(SearchConstants.SOLR_FIELD_TEXT).append(":")
+			.append(escapeKeyword(keyword)).append(" OR ")
+			//TO FETCH THE COMBINATION OF meaning ful keywords
+			.append(SearchConstants.SOLR_FIELD_KEY_SETS)
+			.append(":")
+			.append(escapeKeyword(keyword)).append(" OR ")
+			//Fetch the Synonyms
+			.append(SearchConstants.SOLR_FIELD_SYNONYM_TEXT).append(":")
+			.append(escapeKeyword(keyword)).append("");
+		}
+	
+}
