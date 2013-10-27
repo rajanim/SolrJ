@@ -1,0 +1,21 @@
+package com.os.solr.search.service;
+
+import java.util.List;
+import java.util.Map;
+
+import org.apache.solr.client.solrj.response.TermsResponse.Term;
+
+import com.os.solr.search.form.SearchForm;
+import com.os.solr.search.service.dto.ResultsDTO;
+import com.os.solr.search.service.dto.SearchResultDTO;
+import com.os.solr.search.service.dto.SuggestionsDTO;
+
+
+public interface SearchService {
+
+	public List<SuggestionsDTO> getSuggestions(String keyword);
+	public SearchResultDTO getSearchResults(SearchForm searchForm);
+	public List<Term> getSimilarKeywords(String keyword);
+	public List<ResultsDTO> getDidYouMeanSearchResults(SearchForm searchForm);
+	
+}
