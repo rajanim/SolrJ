@@ -13,9 +13,10 @@ import com.os.solr.search.service.dto.SuggestionsDTO;
 
 public interface SearchService {
 
+	public List<ResultsDTO> getDidYouMeanSearchResults(SearchForm searchForm);
 	public List<SuggestionsDTO> getSuggestions(String keyword);
 	public SearchResultDTO getSearchResults(SearchForm searchForm);
 	public List<Term> getSimilarKeywords(String keyword);
-	public List<ResultsDTO> getDidYouMeanSearchResults(SearchForm searchForm);
+
 	
 }
